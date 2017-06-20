@@ -185,6 +185,7 @@ class Replica(Role):
         super(Replica, self).__init__(node)
         self.execute_fn = execute_fn
         self.state = state
+        # slot标记这是第几次投票
         self.slot = slot
         self.decisions = decisions
         self.peers = peers
@@ -198,40 +199,53 @@ class Replica(Role):
 
     def do_Invoke(self, sender, caller, client_id, input_value):
         proposal = Proposal(caller, client_id, input_value)
+        # 因为这个proposal有可能之前已经接收过一次，所以这里判断一下，如果之前接收了proposal，那么就获取到之前为这个proposal分配的slot
+        # 如果这个replica没有记录这个proposal，那么slot就是None
         slot = next((s for s, p in self.proposals.iteritems() if p == proposal), None)
         # propose, or re-propose if this proposal already has a slot
         self.propose(proposal, slot)
 
     def propose(self, proposal, slot=None):
         """Send (or resend, if slot is specified) a proposal to the leader"""
+        # 如果这个slot是None，也就是说这个proposal是第一次到达这个replica，那么就设置slot的值，也就是往后顺延1位
         if not slot:
             slot, self.next_slot = self.next_slot, self.next_slot + 1
+        # 把proposal放入到map当中去，其实上面已经做了判断，当proposal不存在的情况下才有新的slot，所以这一句可以移到if里面去
         self.proposals[slot] = proposal
         # find a leader we think is working - either the latest we know of, or
         # ourselves (which may trigger a scout to make us the leader)
+        # 找到leader节点，如果找不到最后标记的leader，那么就将自己作为leader
         leader = self.latest_leader or self.node.address
         self.logger.info("proposing %s at slot %d to leader %s" % (proposal, slot, leader))
+        # 给leader发送proposal
         self.node.send([leader], Propose(slot=slot, proposal=proposal))
 
     # handling decided proposals
 
     def do_Decision(self, sender, slot, proposal):
+        # Decision消息是commander角色通过广播发送的
+        # 首先判断本轮投票是否已经有了结果，必须没有结果才能往下走，如果有了结果则返回错误信息
         assert not self.decisions.get(self.slot, None), \
                 "next slot to commit is already decided"
+        # 收到的Decision必须是第一次收到，之前没有处理过，如果之前已经处理过了，则返回错误信息
         if slot in self.decisions:
             assert self.decisions[slot] == proposal, \
                 "slot %d already decided with %r!" % (slot, self.decisions[slot])
             return
+        # 保存Decision
         self.decisions[slot] = proposal
         self.next_slot = max(self.next_slot, slot + 1)
 
         # re-propose our proposal in a new slot if it lost its slot and wasn't a no-op
+        # 如果本地的这轮投票发送的proposal和commander广播的Decision当中的proposal不一致，那么继续发送
         our_proposal = self.proposals.get(slot)
         if our_proposal is not None and our_proposal != proposal and our_proposal.caller:
             self.propose(our_proposal)
 
         # execute any pending, decided proposals
+        # get方法和直接使用中括号来获取值有不同，如果值不存在，中括号会直接报错，而get会返回None
         while True:
+            # 这个循环从self.slot开始遍历decisions表，然后给requester发送Invoked消息
             commit_proposal = self.decisions.get(self.slot)
             if not commit_proposal:
                 break  # not decided yet
@@ -250,18 +264,22 @@ class Replica(Role):
         if proposal.caller is not None:
             # perform a client operation
             self.state, output = self.execute_fn(self.state, proposal.input)
+            # 给requester发送Invoked
             self.node.send([proposal.caller], Invoked(client_id=proposal.client_id, output=output))
 
     # tracking the leader
-
+    
+    # 收到了Adopted消息就表示这个replica和leader在同一个node上
     def do_Adopted(self, sender, ballot_num, accepted_proposals):
         self.latest_leader = self.node.address
         self.leader_alive()
-
+    
+    # Accepting消息是acceptor发送给replica的消息，告知leader是哪个节点。收到了Accepting消息就表示这个replica和acceptor在同一个node上
     def do_Accepting(self, sender, leader):
         self.latest_leader = leader
         self.leader_alive()
 
+    # Active是leader发送的心跳包
     def do_Active(self, sender):
         if sender != self.latest_leader:
             return
@@ -302,8 +320,10 @@ class Commander(Role):
 
     def finished(self, ballot_num, preempted):
         if preempted:
+            # leader和commander一定是在同一个node上，这是发给leader的Preempted消息
             self.node.send([self.node.address], Preempted(slot=self.slot, preempted_by=ballot_num))
         else:
+            # 发给leader的Decided消息 
             self.node.send([self.node.address], Decided(slot=self.slot))
         self.stop()
 
@@ -314,6 +334,7 @@ class Commander(Role):
             self.acceptors.add(sender)
             if len(self.acceptors) < self.quorum:
                 return
+            # 广播Decision
             self.node.send(self.peers, Decision(slot=self.slot, proposal=self.proposal))
             self.finished(ballot_num, False)
         else:
@@ -335,6 +356,7 @@ class Scout(Role):
         self.send_prepare()
 
     def send_prepare(self):
+        # 广播Prepare消息
         self.node.send(self.peers, Prepare(ballot_num=self.ballot_num))
         self.retransmit_timer = self.set_timer(PREPARE_RETRANSMIT, self.send_prepare)
 
@@ -355,6 +377,8 @@ class Scout(Role):
                 accepted_proposals = dict((s, p) for s, (b, p) in self.accepted_proposals.iteritems())
                 # We're adopted; note that this does *not* mean that no other leader is active.
                 # Any such conflicts will be handled by the commanders.
+                # 给自己发送Adopted消息，从结构图中可以看出，能接收Adopted消息类型的role只有leader和replica，从此可以看出，这个leader和replica在同一个node上
+                # 因为send函数是遍历这个node所有的role，并执行所有role的do_函数，所以这里只需要发送1次就可以让leader和replica都收到Adopted消息
                 self.node.send([self.node.address],
                                Adopted(ballot_num=ballot_num, accepted_proposals=accepted_proposals))
                 self.stop()
