@@ -290,6 +290,7 @@ class Replica(Role):
             self.latest_leader_timeout.cancel()
 
         def reset_leader():
+            # 超时之后重新选择一个leader,选择leader的策略就是将当前leader的下一个节电选择为leader
             idx = self.peers.index(self.latest_leader)
             self.latest_leader = self.peers[(idx + 1) % len(self.peers)]
             self.logger.debug("leader timed out; tring the next one, %s", self.latest_leader)
@@ -297,6 +298,7 @@ class Replica(Role):
 
     # adding new cluster members
 
+    # 响应bootstrap发的join消息
     def do_Join(self, sender):
         if sender in self.peers:
             self.node.send([sender], Welcome(
@@ -311,11 +313,14 @@ class Commander(Role):
         self.proposal = proposal
         self.acceptors = set([])
         self.peers = peers
+        # accept合法必须要占peers的一半以上，peers是整个network的节点，因为paxos的算法是accept合法必须要占acceptor的一半以上，从此可以看出集群的每一个node都是acceptor
         self.quorum = len(peers) / 2 + 1
 
     def start(self):
+        # commander刚开始的时候，acceptors为空，第一次就是给全部node，也就是全部acceptor广播Accept消息
         self.node.send(set(self.peers) - self.acceptors, Accept(
                             slot=self.slot, ballot_num=self.ballot_num, proposal=self.proposal))
+        # 这里是递归使用start函数，也就是每隔ACCEPT_RETRANSMIT的时间就执行一次start，但是如果acceptors等于peers，也就是set(self.peers) - self.acceptors等于空，那么send也发送不出去
         self.set_timer(ACCEPT_RETRANSMIT, self.start)
 
     def finished(self, ballot_num, preempted):
@@ -331,7 +336,9 @@ class Commander(Role):
         if slot != self.slot:
             return
         if ballot_num == self.ballot_num:
+            # 记录哪些节点是acceptor
             self.acceptors.add(sender)
+            # accept合法
             if len(self.acceptors) < self.quorum:
                 return
             # 广播Decision
@@ -356,10 +363,12 @@ class Scout(Role):
         self.send_prepare()
 
     def send_prepare(self):
-        # 广播Prepare消息
+        # 广播Prepare消息，这里同样所有的node都是acceptor，所以就是给所有acceptor广播
         self.node.send(self.peers, Prepare(ballot_num=self.ballot_num))
+        # 同样递归广播Prepare消息
         self.retransmit_timer = self.set_timer(PREPARE_RETRANSMIT, self.send_prepare)
 
+    # 这个函数是批量更新self.accepted_proposals
     def update_accepted(self, accepted_proposals):
         acc = self.accepted_proposals
         for slot, (ballot_num, proposal) in accepted_proposals.iteritems():
@@ -402,6 +411,7 @@ class Leader(Role):
     def start(self):
         # reminder others we're active before LEADER_TIMEOUT expires
         def active():
+            # 这个函数也是递归函数，不间断发送心跳包
             if self.active:
                 self.node.send(self.peers, Active())
             self.set_timer(LEADER_TIMEOUT / 2.0, active)
@@ -465,15 +475,22 @@ class Bootstrap(Role):
         self.join()
 
     def join(self):
+        # 递归，给peers广播join
         self.node.send([next(self.peers_cycle)], Join())
         self.set_timer(JOIN_RETRANSMIT, self.join)
 
     def do_Welcome(self, sender, state, slot, decisions):
+        # 正如上面说的，所有的node都是acceptor。这里收到了Welcome消息，将自己的成员acceptor_cls设置为自己的node
         self.acceptor_cls(self.node)
+        # 初始化的node都变成Replica
         self.replica_cls(self.node, execute_fn=self.execute_fn, peers=self.peers,
                          state=state, slot=slot, decisions=decisions)
+        # 这里的一个疑点是为什么自己的成员leader_cls要start(), 因为从代码来看，leader_cls初始化之后，leader的成员active是False，就算是start()也是不会发送心跳包的
+        # 答案是，当集群启动的时候，所有的node都是replica，都是acceptor，都是没有启动的leader，这个时候，如果没有Request发送Invoke消息，那么这个集群其实是不需要leader的，是一个初始集群
+        # 但是，当有一个Request给一个replica发送invoke的时候，replica会给leader发送propose消息，就会激活这个leader，开始发起投票
         self.leader_cls(self.node, peers=self.peers, commander_cls=self.commander_cls,
                         scout_cls=self.scout_cls).start()
+        # 给自己的node消掉自己的Bootstrap角色
         self.stop()
 
 class Seed(Role):
@@ -504,8 +521,10 @@ class Seed(Role):
 
     def finish(self):
         # bootstrap this node into the cluster we just seeded
+        # Seed的任务完成了，已经给self.seen_peers数量的节点发送了Welcome消息，那么self.seen_peers已经变成了Replica，有Replica来形势do_Join的功能，自己不用再行使，所以将自己变成Bootstrap
         bs = self.bootstrap_cls(self.node, peers=self.peers, execute_fn=self.execute_fn)
         bs.start()
+        # 消掉自己的Seed角色
         self.stop()
 
 class Requester(Role):
